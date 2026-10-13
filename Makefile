@@ -1,21 +1,26 @@
-CC             ="clang"
-BIN_OUTPUT     ="$(pwd)bin/"
-BIN_NAME       ="mish"
-SRC            ="$(pwd)src"
-CC_FLAGS       ="-Wextra" "-Wall" "-std=gnu99" "-Isrc/" "-DHASH_TYPE=FNV_1A"
-DEBUGGER       =""
-INVOC_ARGS     =""
+CARGO ?= cargo
+BIN_OUTPUT ?= bin
+INVOC_ARGS ?=
 
-.PHONY: compile
+.PHONY: compile run clean sequence test check
 
 compile:
-	@mkdir -p $(BIN_OUTPUT)
-	@$(CC) -o $(BIN_OUTPUT)$(BIN_NAME) -I $(SRC) $(SRC)/*.c $(CC_FLAGS)
+	$(CARGO) build --release
+	mkdir -p "$(BIN_OUTPUT)"
+	cp target/release/mish "$(BIN_OUTPUT)/mish"
 
-run:
-	@if [ $(DEBUGGER) = "" ]; then $(BIN_OUTPUT)$(BIN_NAME) $(INVOC_ARGS); else $(DEBUGGER) $(BIN_OUTPUT)$(BIN_NAME); fi
+run: compile
+	"$(BIN_OUTPUT)/mish" $(INVOC_ARGS)
+
+test:
+	$(CARGO) test
+
+check:
+	$(CARGO) fmt --check
+	$(CARGO) clippy --all-targets -- -D warnings
 
 clean:
-	@rm -r $(BIN_OUTPUT)
+	$(CARGO) clean
+	rm -f "$(BIN_OUTPUT)/mish"
 
-sequence: compile run
+sequence: run

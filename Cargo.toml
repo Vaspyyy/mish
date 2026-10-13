@@ -1,0 +1,11 @@
+[package]
+name = "mish"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "GPL-3.0-only"
+description = "A small Unix shell with aliases and explicit variable expansion"
+
+[profile.release]
+lto = true
+strip = true

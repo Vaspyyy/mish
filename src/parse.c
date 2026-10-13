@@ -1,394 +1,899 @@
-#include <asm-generic/errno-base.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <stdbool.h>
-#include <unistd.h>
-#include <string.h>
-#include <stdlib.h>
-#include <libgen.h>
-#include <fcntl.h>
+#include "mish.h"
+
+#include <ctype.h>
 #include <errno.h>
-#include <stdio.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
 
-#include "parse.h"
-#include "alias.h"
-#include "exec.h"
-#include "path.h"
-#include "envp.h"
-#include "arg.h"
+typedef struct {
+    TokenVec tokens;
+    size_t position;
+    unsigned depth;
+    ParseError *error;
+    bool failed;
+} Parser;
 
-// remake an arg (like input), doing the following:
-//
-// 1. replacing the immediate first argument with an alias
-// 2. (to be added) globbing files
-// 3. consuming args that are DEFS=something
-bool remake_arg(arg_t *dest, const arg_t src) {
-	if (!dest) return 1;
-	dest->len = 0;
-	size_t src_i = 0;
+typedef struct {
+    const char *const *words;
+    TokenType closer;
+    bool has_closer;
+    bool case_separator;
+    bool brace_separator;
+} Stop;
 
-	bool aliased = false;
+static Node *parse_list(Parser *parser, Stop stop);
+static Node *parse_command(Parser *parser);
+static Node *parse_if(Parser *parser, bool elif);
 
-	while (src_i < src.len) {
-		// realloc if needed
-		if (dest->len >= dest->asz) {
-			if (alloc_arg(dest, ARGV_ASZ) != 0) return 1;
-		}
-
-		arg_t arg = cap_to_white(shift_arg(src, src_i));
-
-		// aliases
-		if (aliased == false && !EMPTY_C(src.ptr[src_i])) {
-			// make the alias
-			arg_t alias = find_alias(arg, NULL);
-
-			// put it in the dest
-			if ((dest->len + alias.len) >= dest->asz) {
-				if (alloc_arg(dest, MAX(ARGV_ASZ, alias.len))) return 1;
-			}
-
-			dest->len += snprintf(dest->ptr + dest->len, dest->asz - dest->len,
-				"%.*s", (int)alias.len, alias.ptr);
-
-			idx_to_white(&src_i, src);
-			aliased = true;
-			continue;
-		}
-
-		dest->ptr[dest->len++] = src.ptr[src_i++];
-	}
-
-	return 0;
+static Token *peek(Parser *parser)
+{
+    if (parser->position >= parser->tokens.len) {
+        return &parser->tokens.items[parser->tokens.len - 1];
+    }
+    return &parser->tokens.items[parser->position];
 }
 
-#define PIPE_READ  0
-#define PIPE_WRITE 1
-
-// expand a command
-//
-// memory is allocated, make sure to free it
-char *expand_cmd(const char *src) {
-	(void)src;
-
-	int fd[2] = {0};
-	if (pipe(fd) != 0) return NULL;
-	if (fcntl(fd[PIPE_READ], F_SETFL, O_NONBLOCK) == -1) return NULL;
-
-	pid_t child = fork();
-	switch (child) {
-		case -1: return NULL;
-
-		case 0: {
-			dup2(fd[PIPE_WRITE], STDOUT_FILENO);
-
-			arg_t remade = {0};
-			if (remake_arg(&remade, make_arg(src)) != 0) exit(0);
-			if (arg_empty(remade)) exit(0);
-
-			arg_arr_t child_argv = {0};
-
-			int child_argc = 0;
-			if (make_child_argv(remade, &child_argv, &child_argc, ARGV_ARR_ASZ) != 0) exit(0);
-			if (!child_argc) exit(0);
-
-			// turn into regular argv
-			char **passed_argv = calloc(sizeof(passed_argv[0]), child_argc + 1);
-			if (!passed_argv) exit(0);
-
-			for (int i = 0; i < child_argc; i++) {
-				passed_argv[i] = child_argv.ptr[i].ptr;
-			}
-
-			execute(child_argc, passed_argv, child_envp.dp, NO_FORK);
-
-			exit(0);
-			break;
-		}
-
-		default: {
-			int status;
-			while (waitpid(child, &status, WNOHANG) != -1) {};
-
-			arg_t buf = {0}; // returned
-			char   ch = 0;
-			while (read(fd[PIPE_READ], &ch, 1) && errno != EAGAIN) {
-				if (buf.len >= buf.asz) {
-					if (alloc_arg(&buf, ARGV_ASZ) != 0) return NULL;
-				}
-
-				buf.ptr[buf.len++] = ch;
-			}
-
-			// replace final whitespace with null
-			if (buf.len && EMPTY_C(buf.ptr[buf.len - 1])) buf.ptr[buf.len - 1] = '\0';
-			// null term
-			else if (buf.len && (buf.ptr[buf.len - 1] != '\0' || EMPTY_C(buf.ptr[buf.len - 1]))) {
-				if (alloc_arg(&buf, 1) != 0) return NULL;
-				buf.ptr[buf.len] = '\0';
-			}
-
-			close(fd[PIPE_READ]);
-			close(fd[PIPE_WRITE]);
-			return buf.ptr;
-			break;
-		}
-	}
-
-	return NULL;
+static Token *lookahead(Parser *parser, size_t distance)
+{
+    size_t index = parser->position + distance;
+    if (index >= parser->tokens.len) {
+        index = parser->tokens.len - 1;
+    }
+    return &parser->tokens.items[index];
 }
 
-// expands a src (at src_i) into an env var, or cmd expansion, etc
-//
-// if it fails to expand, return 1
-//
-// src is expected to be at dollar sign
-bool expand(arg_t *dest, const arg_t src, size_t *src_i) {
-	if (src.ptr[*src_i] != '$') return 1;
-
-	// skip dollar sign
-	++(*src_i);
-
-	// starts after dollar sign
-	arg_t arg = {
-		.ptr = src.ptr + *src_i,
-		.len = src.len - *src_i,
-		.asz = src.asz - *src_i,
-	};
-	char op = '\0';
-	char cl = '\0';
-
-	// find the proper stuff
-	switch (src.ptr[*src_i]) {
-		case '(': {
-			op = '(';
-			cl = ')';
-			break;
-		}
-
-		case '[': {
-			op = '[';
-			cl = ']';
-			break;
-		}
-
-		default: {
-			--(*src_i);
-			return 1;
-		}
-	}
-
-	// find the closing thingie
-	char *close = find_closer(arg, op, cl);
-	if (!close) return 1;
-
-	// encapsulates the whole $(THING)
-	arg.len = close - arg.ptr + 1;
-
-	// used to find env var
-	char *start = arg.ptr + 1;
-	*close = '\0';
-
-	// make sure to skip everything from the source
-	*src_i += strlen(start) + 2;
-	char *content = NULL;
-
-	// make the string for comparisons
-
-	arg_t comp = {0};
-	if (parse_arg(&comp, make_arg(start), 0) != 0) return 1;
-
-	switch (op) {
-		case '(': {
-			// env vars
-			content = shell_get_env(comp.ptr);
-			break;
-		}
-
-		case '[': {
-			// command expansion
-			content = expand_cmd(comp.ptr);
-			break;
-		}
-	}
-
-	free_arg(&comp);
-
-	// wasnt found
-	if (!content) {
-		return 0;
-	};
-
-	// append to dest
-	// increase size if needed
-	size_t cont_len = strlen(content);
-	if ((dest->len + cont_len) >= dest->asz) {
-		if (alloc_arg(dest, MAX(cont_len, ARGV_ASZ)) != 0) return 1;
-	}
-
-	dest->len += snprintf(dest->ptr + dest->len,
-		dest->asz - dest->len,
-		"%s", content);
-
-	*close = cl;
-	if (op == '[') free(content);
-
-	return 0;
+static void consume(Parser *parser)
+{
+    if (peek(parser)->type != TOK_EOF) {
+        ++parser->position;
+    }
 }
 
-// form an arg, allocating memory automatically
-//
-// return 1 on errors
-//
-// f field adds extra functionality (that acts independent of quote):
-// - turning escape characters into their counterparts
-bool parse_arg(arg_t *dest, arg_t src, bool f) {
-	if (!dest) return 1;
-	free_arg(dest);
-	size_t src_i  = 0;
-	dest->len = 0;
-
-	char quote_type = NO_QUOTES;
-	bool back = false;
-	bool  esc = false;
-
-	while (src_i < src.len) {
-		// realloc if needed
-		if (dest->len >= dest->asz) {
-			if (alloc_arg(dest, ARGV_ASZ) != 0) return 1;
-		}
-
-		switch (src.ptr[src_i]) {
-			// stuff like env vars
-			case '$': {
-				if (quote_type == QUOTE_SIN) goto copy_memory;
-				if (expand(dest, src, &src_i) != 0) goto copy_memory;
-
-				continue;
-			}
-
-			// home dir on start
-			case '~': {
-				if (quote_type == QUOTE_SIN || dest->len != 0) goto copy_memory;
-
-				char *env = shell_get_env("HOME");
-				if (!env) goto copy_memory;
-
-				size_t env_len = strlen(env);
-				if ((dest->len + env_len) >= dest->asz) {
-					if (alloc_arg(dest, MAX(env_len, ARGV_ASZ)) != 0) return 1;
-				}
-
-				dest->len += snprintf(dest->ptr + dest->len,
-					dest->asz - dest->len,
-					"%.*s", (int)env_len, env);
-
-				++src_i;
-				continue;
-			}
-
-			case '\\': {
-				if (f) esc = true;
-				if (quote_type != NO_QUOTES) goto copy_memory;
-				back = true;
-				++src_i;
-
-				goto copy_memory;
-			}
-
-			default: {
-				goto copy_memory;
-				break;
-			}
-		}
-
-		copy_memory:
-		if (src_i >= src.len) break;
-
-		if (esc) {
-			esc = false;
-
-			switch (src.ptr[src_i]) {
-				case 'e': {
-					dest->ptr[dest->len++] = '\x1b';
-					++src_i;
-					continue;
-					break;
-				}
-			}
-		}
-
-		if (!back && determine_quote(src.ptr[src_i], &quote_type)) {
-			++src_i;
-			continue;
-
-		} else {
-			back = false;
-		}
-
-		dest->ptr[dest->len++] = src.ptr[src_i++];
-	}
-
-	// null term
-	if (dest->len > dest->asz || !dest->ptr) {
-		if (alloc_arg(dest, 1) != 0) return 1;
-	}
-	dest->ptr[dest->len] = '\0';
-
-	return 0;
+static bool word_is(Parser *parser, const char *word)
+{
+    Token *token = peek(parser);
+    return token->type == TOK_WORD && strcmp(token->text, word) == 0;
 }
 
-// parse an arg into an arg_arr_t
-bool make_child_argv(const arg_t arg, arg_arr_t *child_argv, int *child_argc, size_t asz) {
-	if (!child_argv || !child_argc) return 1;
+static void parser_error(Parser *parser, const char *message, bool incomplete)
+{
+    parser->failed = true;
+    if (parser->error == NULL || parser->error->message != NULL) {
+        return;
+    }
+    Token *token = peek(parser);
+    parser->error->message = xstrdup(message);
+    parser->error->line = token->line;
+    parser->error->column = token->column;
+    parser->error->incomplete = incomplete;
+}
 
-	arg_t    work = arg;
-	bool def_able = true;
+static void unexpected(Parser *parser, const char *expected)
+{
+    Token *token = peek(parser);
+    char *message;
+    if (token->type == TOK_EOF) {
+        message = str_printf("expected %s before end of input", expected);
+    } else {
+        message = str_printf("expected %s, found '%s'", expected, token->text);
+    }
+    parser_error(parser, message, token->type == TOK_EOF);
+    free(message);
+}
 
-	while (work.len) {
-		if ((size_t)(*child_argc + 1) >= (child_argv->asz / sizeof(arg_t))) {
-			if (alloc_arg_arr(child_argv, asz) != 0) return 1;
-		}
+static bool expect_type(Parser *parser, TokenType type, const char *description)
+{
+    if (peek(parser)->type != type) {
+        unexpected(parser, description);
+        return false;
+    }
+    consume(parser);
+    return true;
+}
 
-		work = skip_whitespace(work);
+static bool expect_word(Parser *parser, const char *word)
+{
+    if (!word_is(parser, word)) {
+        unexpected(parser, word);
+        return false;
+    }
+    consume(parser);
+    return true;
+}
 
-		// limits size to whitespace
-		arg_t cmd_arg = cap_to_white(work);
-		if (arg_empty(cmd_arg)) break;
+static void skip_newlines(Parser *parser)
+{
+    while (peek(parser)->type == TOK_NEWLINE) {
+        consume(parser);
+    }
+}
 
-		if (parse_arg(&child_argv->ptr[*child_argc], cmd_arg, 0) != 0) return 1;
+static bool at_stop(Parser *parser, Stop stop)
+{
+    Token *token = peek(parser);
+    if (stop.has_closer && token->type == stop.closer) {
+        return true;
+    }
+    if (stop.case_separator && token->type == TOK_DSEMI) {
+        return true;
+    }
+    if (token->type == TOK_WORD && stop.words != NULL) {
+        for (size_t index = 0; stop.words[index] != NULL; ++index) {
+            if (strcmp(token->text, stop.words[index]) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
-		// end early if fully empty stuff
-		if (arg_empty(child_argv->ptr[*child_argc])) {
-			goto skip;
-		}
+static bool reserved_word(const char *word)
+{
+    static const char *const reserved[] = {
+        "then", "elif", "else", "fi", "do", "done", "in", "esac", NULL
+    };
+    for (size_t index = 0; reserved[index] != NULL; ++index) {
+        if (strcmp(word, reserved[index]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
-		// definitions get skipped and used up
-		if (arg_is_def(child_argv->ptr[*child_argc]) && def_able) {
-			char *eq = arg_chr(child_argv->ptr[*child_argc], '=');
-			if (!eq) goto skip;
+static Node *single_child(NodeType type, Node *child, size_t line)
+{
+    Node *node = node_new(type);
+    node->line = line;
+    node_add_child(node, child);
+    return node;
+}
 
-			// make the two strings
-			char *b = calloc(1, child_argv->ptr[*child_argc].len + 1);
-			if (!b) return 1;
-			memcpy(b, child_argv->ptr[*child_argc].ptr, child_argv->ptr[*child_argc].len);
+static void append_redirection(Node *node, Redir *redirection)
+{
+    Redir **tail = &node->redirs;
+    while (*tail != NULL) {
+        tail = &(*tail)->next;
+    }
+    *tail = redirection;
+}
 
-			// make the two strings
-			b[eq - child_argv->ptr[*child_argc].ptr] = '\0';
-			char *label = b;
-			char   *val = &b[eq - child_argv->ptr[*child_argc].ptr + 1];
+static Redir *new_redirection(int fd, RedirType type, const char *word)
+{
+    Redir *redirection = xcalloc(1, sizeof(*redirection));
+    redirection->fd = fd;
+    redirection->type = type;
+    redirection->word = xstrdup(word);
+    return redirection;
+}
 
-			shell_set_env(label, val);
-			if (!strcmp(label, "PATH")) refresh_path();
+static int parse_redirection(Parser *parser, Node *node)
+{
+    Token *token = peek(parser);
+    const char *operator = token->text;
+    int fd = -1;
+    if (isdigit((unsigned char)*operator)) {
+        errno = 0;
+        char *end;
+        long descriptor = strtol(operator, &end, 10);
+        if (errno != 0 || descriptor > INT_MAX) {
+            parser_error(parser, "redirection descriptor out of range", false);
+            return -1;
+        }
+        fd = (int)descriptor;
+        operator = end;
+    }
+    RedirType type;
+    bool both = false;
+    if (strcmp(operator, "<") == 0) {
+        type = REDIR_INPUT;
+    } else if (strcmp(operator, ">") == 0) {
+        type = REDIR_OUTPUT;
+    } else if (strcmp(operator, ">>") == 0) {
+        type = REDIR_APPEND;
+    } else if (strcmp(operator, ">|") == 0) {
+        type = REDIR_CLOBBER;
+    } else if (strcmp(operator, "<&") == 0) {
+        type = REDIR_DUP_INPUT;
+    } else if (strcmp(operator, ">&") == 0) {
+        type = REDIR_DUP_OUTPUT;
+    } else if (strcmp(operator, "<>") == 0) {
+        type = REDIR_READWRITE;
+    } else if (strcmp(operator, "<<") == 0 || strcmp(operator, "<<-") == 0) {
+        type = REDIR_HEREDOC;
+    } else if (strcmp(operator, "<<<") == 0) {
+        type = REDIR_HERESTRING;
+    } else if (strcmp(operator, "&>") == 0 || strcmp(operator, "&>>") == 0) {
+        type = strcmp(operator, "&>>") == 0 ? REDIR_APPEND : REDIR_OUTPUT;
+        both = true;
+    } else {
+        parser_error(parser, "unsupported redirection operator", false);
+        return -1;
+    }
+    if (fd < 0) {
+        fd = *operator == '<' ? 0 : 1;
+    }
+    consume(parser);
+    if (peek(parser)->type != TOK_WORD) {
+        unexpected(parser, "redirection target");
+        return -1;
+    }
+    Redir *redirection = new_redirection(fd, type, peek(parser)->text);
+    if (type == REDIR_HEREDOC) {
+        redirection->heredoc = xstrdup(token->heredoc == NULL ? "" : token->heredoc);
+        redirection->heredoc_expand = token->heredoc_expand;
+    }
+    append_redirection(node, redirection);
+    if (both) {
+        append_redirection(node, new_redirection(2, REDIR_DUP_OUTPUT, "1"));
+    }
+    consume(parser);
+    return 0;
+}
 
-			goto skip;
-		} else def_able = false;
+static bool require_body(Parser *parser, Node *body, const char *description)
+{
+    if (body != NULL && body->count != 0) {
+        return true;
+    }
+    if (!parser->failed) {
+        parser_error(parser, description, peek(parser)->type == TOK_EOF);
+    }
+    return false;
+}
 
-		(*child_argc)++;
+static Node *parse_simple(Parser *parser)
+{
+    Node *node = node_new(NODE_SIMPLE);
+    node->line = peek(parser)->line;
+    while (peek(parser)->type == TOK_WORD || peek(parser)->type == TOK_REDIR) {
+        if (peek(parser)->type == TOK_REDIR) {
+            if (parse_redirection(parser, node) != 0) {
+                node_free(node);
+                return NULL;
+            }
+        } else {
+            strvec_push(&node->words, peek(parser)->text);
+            consume(parser);
+        }
+    }
+    if (node->words.len == 0 && node->redirs == NULL) {
+        unexpected(parser, "command");
+        node_free(node);
+        return NULL;
+    }
+    return node;
+}
 
-		skip: {
-			work = goto_whitespace(work);
-		}
-	}
+static Node *parse_group(Parser *parser, bool subshell)
+{
+    size_t line = peek(parser)->line;
+    consume(parser);
+    Stop stop;
+    memset(&stop, 0, sizeof(stop));
+    stop.has_closer = true;
+    stop.closer = subshell ? TOK_RPAREN : TOK_RBRACE;
+    stop.brace_separator = !subshell;
+    Node *body = parse_list(parser, stop);
+    if (!require_body(parser, body, "empty compound command") ||
+        !expect_type(parser, stop.closer, subshell ? ")" : "}")) {
+        node_free(body);
+        return NULL;
+    }
+    return single_child(subshell ? NODE_SUBSHELL : NODE_GROUP, body, line);
+}
 
-	return 0;
+static Node *parse_if(Parser *parser, bool elif)
+{
+    size_t line = peek(parser)->line;
+    if (!expect_word(parser, elif ? "elif" : "if")) {
+        return NULL;
+    }
+    static const char *const condition_stop[] = {"then", NULL};
+    static const char *const body_stop[] = {"elif", "else", "fi", NULL};
+    static const char *const else_stop[] = {"fi", NULL};
+    Stop stop;
+    memset(&stop, 0, sizeof(stop));
+    stop.words = condition_stop;
+    Node *condition = parse_list(parser, stop);
+    if (!require_body(parser, condition, "if requires a condition") ||
+        !expect_word(parser, "then")) {
+        node_free(condition);
+        return NULL;
+    }
+    stop.words = body_stop;
+    Node *body = parse_list(parser, stop);
+    if (!require_body(parser, body, "then requires a command list")) {
+        node_free(condition);
+        node_free(body);
+        return NULL;
+    }
+    Node *node = node_new(NODE_IF);
+    node->line = line;
+    node_add_child(node, condition);
+    node_add_child(node, body);
+    if (word_is(parser, "elif")) {
+        if (++parser->depth >= MISH_MAX_DEPTH) {
+            parser_error(parser, "conditional nesting limit exceeded", false);
+            node_free(node);
+            --parser->depth;
+            return NULL;
+        }
+        Node *alternative = parse_if(parser, true);
+        --parser->depth;
+        if (alternative == NULL) {
+            node_free(node);
+            return NULL;
+        }
+        node_add_child(node, alternative);
+        /* The recursive elif owns the final fi token. */
+        return node;
+    }
+    if (word_is(parser, "else")) {
+        consume(parser);
+        stop.words = else_stop;
+        Node *alternative = parse_list(parser, stop);
+        if (!require_body(parser, alternative, "else requires a command list")) {
+            node_free(alternative);
+            node_free(node);
+            return NULL;
+        }
+        node_add_child(node, alternative);
+    }
+    if (!expect_word(parser, "fi")) {
+        node_free(node);
+        return NULL;
+    }
+    return node;
+}
+
+static Node *parse_loop(Parser *parser, bool until)
+{
+    size_t line = peek(parser)->line;
+    consume(parser);
+    static const char *const condition_stop[] = {"do", NULL};
+    static const char *const body_stop[] = {"done", NULL};
+    Stop stop;
+    memset(&stop, 0, sizeof(stop));
+    stop.words = condition_stop;
+    Node *condition = parse_list(parser, stop);
+    if (!require_body(parser, condition, "loop requires a condition") ||
+        !expect_word(parser, "do")) {
+        node_free(condition);
+        return NULL;
+    }
+    stop.words = body_stop;
+    Node *body = parse_list(parser, stop);
+    if (!require_body(parser, body, "loop requires a body") ||
+        !expect_word(parser, "done")) {
+        node_free(condition);
+        node_free(body);
+        return NULL;
+    }
+    Node *node = node_new(until ? NODE_UNTIL : NODE_WHILE);
+    node->line = line;
+    node_add_child(node, condition);
+    node_add_child(node, body);
+    return node;
+}
+
+static Node *parse_for(Parser *parser)
+{
+    size_t line = peek(parser)->line;
+    consume(parser);
+    if (peek(parser)->type == TOK_WORD && strncmp(peek(parser)->text, "((", 2) == 0) {
+        const char *raw = peek(parser)->text;
+        size_t length = strlen(raw);
+        Node *node = node_new(NODE_ARITH_FOR);
+        node->line = line;
+        size_t start = 2;
+        unsigned parentheses = 0;
+        for (size_t index = 2; index < length - 2; ++index) {
+            if (raw[index] == '(') {
+                ++parentheses;
+            } else if (raw[index] == ')' && parentheses != 0) {
+                --parentheses;
+            } else if (raw[index] == ';' && parentheses == 0) {
+                strvec_push_owned(&node->words, xstrndup(raw + start, index - start));
+                start = index + 1;
+            }
+        }
+        strvec_push_owned(&node->words, xstrndup(raw + start, length - 2 - start));
+        if (node->words.len != 3) {
+            parser_error(parser, "arithmetic for requires init; condition; step", false);
+            node_free(node);
+            return NULL;
+        }
+        consume(parser);
+        if (peek(parser)->type == TOK_SEMI) {
+            consume(parser);
+        }
+        skip_newlines(parser);
+        if (!expect_word(parser, "do")) {
+            node_free(node);
+            return NULL;
+        }
+        static const char *const arithmetic_body_stop[] = {"done", NULL};
+        Stop stop;
+        memset(&stop, 0, sizeof(stop));
+        stop.words = arithmetic_body_stop;
+        Node *body = parse_list(parser, stop);
+        if (!require_body(parser, body, "arithmetic for requires a body") ||
+            !expect_word(parser, "done")) {
+            node_free(body);
+            node_free(node);
+            return NULL;
+        }
+        node_add_child(node, body);
+        return node;
+    }
+    if (peek(parser)->type != TOK_WORD || !valid_name(peek(parser)->text)) {
+        unexpected(parser, "for variable name");
+        return NULL;
+    }
+    Node *node = node_new(NODE_FOR);
+    node->line = line;
+    node->name = xstrdup(peek(parser)->text);
+    consume(parser);
+    bool header_newline = peek(parser)->type == TOK_NEWLINE;
+    skip_newlines(parser);
+    if (word_is(parser, "in")) {
+        consume(parser);
+        while (peek(parser)->type == TOK_WORD) {
+            strvec_push(&node->words, peek(parser)->text);
+            consume(parser);
+        }
+        if (peek(parser)->type != TOK_SEMI && peek(parser)->type != TOK_NEWLINE) {
+            unexpected(parser, "separator after for words");
+            node_free(node);
+            return NULL;
+        }
+        consume(parser);
+        skip_newlines(parser);
+    } else {
+        strvec_push(&node->words, "\"$@\"");
+        if (peek(parser)->type == TOK_SEMI) {
+            consume(parser);
+            skip_newlines(parser);
+        } else if (!header_newline) {
+            unexpected(parser, "separator after for variable");
+            node_free(node);
+            return NULL;
+        }
+    }
+    if (!expect_word(parser, "do")) {
+        node_free(node);
+        return NULL;
+    }
+    static const char *const body_stop[] = {"done", NULL};
+    Stop stop;
+    memset(&stop, 0, sizeof(stop));
+    stop.words = body_stop;
+    Node *body = parse_list(parser, stop);
+    if (!require_body(parser, body, "for requires a body") || !expect_word(parser, "done")) {
+        node_free(body);
+        node_free(node);
+        return NULL;
+    }
+    node_add_child(node, body);
+    return node;
+}
+
+static Node *parse_case(Parser *parser)
+{
+    size_t line = peek(parser)->line;
+    consume(parser);
+    if (peek(parser)->type != TOK_WORD) {
+        unexpected(parser, "case subject");
+        return NULL;
+    }
+    Node *node = node_new(NODE_CASE);
+    node->line = line;
+    node->name = xstrdup(peek(parser)->text);
+    consume(parser);
+    skip_newlines(parser);
+    if (!expect_word(parser, "in")) {
+        node_free(node);
+        return NULL;
+    }
+    skip_newlines(parser);
+    CaseArm **tail = &node->cases;
+    while (!word_is(parser, "esac")) {
+        if (peek(parser)->type == TOK_EOF) {
+            unexpected(parser, "esac");
+            node_free(node);
+            return NULL;
+        }
+        if (peek(parser)->type == TOK_LPAREN) {
+            consume(parser);
+        }
+        CaseArm *arm = xcalloc(1, sizeof(*arm));
+        strvec_init(&arm->patterns);
+        for (;;) {
+            if (peek(parser)->type != TOK_WORD) {
+                unexpected(parser, "case pattern");
+                strvec_free(&arm->patterns);
+                free(arm);
+                node_free(node);
+                return NULL;
+            }
+            strvec_push(&arm->patterns, peek(parser)->text);
+            consume(parser);
+            if (peek(parser)->type != TOK_PIPE) {
+                break;
+            }
+            consume(parser);
+        }
+        if (!expect_type(parser, TOK_RPAREN, ") after case patterns")) {
+            strvec_free(&arm->patterns);
+            free(arm);
+            node_free(node);
+            return NULL;
+        }
+        static const char *const arm_stop[] = {"esac", NULL};
+        Stop stop;
+        memset(&stop, 0, sizeof(stop));
+        stop.words = arm_stop;
+        stop.case_separator = true;
+        arm->body = parse_list(parser, stop);
+        if (arm->body == NULL) {
+            strvec_free(&arm->patterns);
+            free(arm);
+            node_free(node);
+            return NULL;
+        }
+        *tail = arm;
+        tail = &arm->next;
+        if (peek(parser)->type == TOK_DSEMI) {
+            consume(parser);
+            skip_newlines(parser);
+        } else if (!word_is(parser, "esac")) {
+            unexpected(parser, ";; or esac");
+            node_free(node);
+            return NULL;
+        }
+    }
+    consume(parser);
+    return node;
+}
+
+static bool compound_start(Parser *parser)
+{
+    TokenType type = peek(parser)->type;
+    return type == TOK_LPAREN || type == TOK_LBRACE ||
+        word_is(parser, "if") || word_is(parser, "while") ||
+        word_is(parser, "until") || word_is(parser, "for") || word_is(parser, "case");
+}
+
+static Node *parse_function(Parser *parser, bool keyword)
+{
+    size_t line = peek(parser)->line;
+    if (keyword) {
+        consume(parser);
+    }
+    if (peek(parser)->type != TOK_WORD || !valid_name(peek(parser)->text)) {
+        unexpected(parser, "function name");
+        return NULL;
+    }
+    char *name = xstrdup(peek(parser)->text);
+    consume(parser);
+    if (peek(parser)->type == TOK_LPAREN) {
+        consume(parser);
+        if (!expect_type(parser, TOK_RPAREN, ") after function name")) {
+            free(name);
+            return NULL;
+        }
+    } else if (!keyword) {
+        unexpected(parser, "() after function name");
+        free(name);
+        return NULL;
+    }
+    skip_newlines(parser);
+    if (!compound_start(parser)) {
+        unexpected(parser, "compound function body");
+        free(name);
+        return NULL;
+    }
+    Node *body = parse_command(parser);
+    if (body == NULL) {
+        free(name);
+        return NULL;
+    }
+    Node *node = single_child(NODE_FUNCTION, body, line);
+    node->name = name;
+    return node;
+}
+
+static Node *parse_command(Parser *parser)
+{
+    if (++parser->depth > MISH_MAX_DEPTH) {
+        parser_error(parser, "command nesting limit exceeded", false);
+        --parser->depth;
+        return NULL;
+    }
+    Node *node = NULL;
+    Token *token = peek(parser);
+    if (token->type == TOK_WORD && strncmp(token->text, "((", 2) == 0) {
+        size_t length = strlen(token->text);
+        char *expression = xstrndup(token->text + 2, length - 4);
+        node = node_new(NODE_SIMPLE);
+        node->line = token->line;
+        strvec_push(&node->words, "let");
+        strvec_push_owned(&node->words, shell_quote(expression));
+        free(expression);
+        consume(parser);
+    } else if (token->type == TOK_LPAREN) {
+        node = parse_group(parser, true);
+    } else if (token->type == TOK_LBRACE) {
+        node = parse_group(parser, false);
+    } else if (word_is(parser, "if")) {
+        node = parse_if(parser, false);
+    } else if (word_is(parser, "while") || word_is(parser, "until")) {
+        node = parse_loop(parser, word_is(parser, "until"));
+    } else if (word_is(parser, "for")) {
+        node = parse_for(parser);
+    } else if (word_is(parser, "case")) {
+        node = parse_case(parser);
+    } else if (word_is(parser, "function")) {
+        node = parse_function(parser, true);
+    } else if (token->type == TOK_WORD && valid_name(token->text) &&
+               lookahead(parser, 1)->type == TOK_LPAREN && lookahead(parser, 2)->type == TOK_RPAREN) {
+        node = parse_function(parser, false);
+    } else if (token->type == TOK_WORD && reserved_word(token->text)) {
+        parser_error(parser, "unexpected reserved word", false);
+    } else {
+        node = parse_simple(parser);
+    }
+    if (node != NULL) {
+        while (peek(parser)->type == TOK_REDIR) {
+            if (parse_redirection(parser, node) != 0) {
+                node_free(node);
+                node = NULL;
+                break;
+            }
+        }
+    }
+    --parser->depth;
+    return node;
+}
+
+static Node *parse_pipeline(Parser *parser)
+{
+    bool negate = false;
+    size_t line = peek(parser)->line;
+    if (word_is(parser, "!")) {
+        negate = true;
+        consume(parser);
+        skip_newlines(parser);
+    }
+    Node *first = parse_command(parser);
+    if (first == NULL) {
+        return NULL;
+    }
+    Node *result = first;
+    if (peek(parser)->type == TOK_PIPE) {
+        Node *pipeline = node_new(NODE_PIPE);
+        pipeline->line = line;
+        node_add_child(pipeline, first);
+        while (peek(parser)->type == TOK_PIPE) {
+            bool stderr_pipe = strcmp(peek(parser)->text, "|&") == 0;
+            consume(parser);
+            skip_newlines(parser);
+            if (stderr_pipe) {
+                Node *previous = pipeline->children[pipeline->count - 1];
+                append_redirection(previous, new_redirection(2, REDIR_DUP_OUTPUT, "1"));
+            }
+            Node *next = parse_command(parser);
+            if (next == NULL) {
+                node_free(pipeline);
+                return NULL;
+            }
+            node_add_child(pipeline, next);
+        }
+        result = pipeline;
+    }
+    if (negate) {
+        result = single_child(NODE_NOT, result, line);
+    }
+    return result;
+}
+
+static Node *parse_and_or(Parser *parser)
+{
+    Node *left = parse_pipeline(parser);
+    if (left == NULL) {
+        return NULL;
+    }
+    unsigned chain = 0;
+    while (peek(parser)->type == TOK_AND || peek(parser)->type == TOK_OR) {
+        if (++chain + parser->depth >= MISH_MAX_DEPTH) {
+            parser_error(parser, "logical operator nesting limit exceeded", false);
+            node_free(left);
+            return NULL;
+        }
+        Token *operator = peek(parser);
+        NodeType type = operator->type == TOK_AND ? NODE_AND : NODE_OR;
+        size_t line = operator->line;
+        consume(parser);
+        skip_newlines(parser);
+        Node *right = parse_pipeline(parser);
+        if (right == NULL) {
+            node_free(left);
+            return NULL;
+        }
+        Node *combined = node_new(type);
+        combined->line = line;
+        node_add_child(combined, left);
+        node_add_child(combined, right);
+        left = combined;
+    }
+    return left;
+}
+
+static Node *parse_list(Parser *parser, Stop stop)
+{
+    Node *list = node_new(NODE_LIST);
+    list->line = peek(parser)->line;
+    skip_newlines(parser);
+    while (peek(parser)->type != TOK_EOF && !at_stop(parser, stop)) {
+        Node *command = parse_and_or(parser);
+        if (command == NULL) {
+            node_free(list);
+            return NULL;
+        }
+        TokenType separator = peek(parser)->type;
+        if (separator == TOK_AMP) {
+            command = single_child(NODE_BACKGROUND, command, command->line);
+            consume(parser);
+            skip_newlines(parser);
+            node_add_child(list, command);
+            continue;
+        }
+        node_add_child(list, command);
+        if (separator == TOK_SEMI || separator == TOK_NEWLINE) {
+            consume(parser);
+            skip_newlines(parser);
+            continue;
+        }
+        if (at_stop(parser, stop)) {
+            if (stop.brace_separator && peek(parser)->type == TOK_RBRACE) {
+                parser_error(parser, "expected separator before closing brace", false);
+                node_free(list);
+                return NULL;
+            }
+            break;
+        }
+        if (peek(parser)->type == TOK_EOF) {
+            break;
+        }
+        unexpected(parser, "command separator");
+        node_free(list);
+        return NULL;
+    }
+    return list;
+}
+
+/* Parser recursion alone does not bound a tree assembled by successive
+ * left-associative operators. Validate the actual result before handing it to
+ * the executor, function registry, or serializer. */
+static bool validate_tree(Parser *parser, const Node *node, unsigned depth)
+{
+    if (node == NULL) {
+        parser_error(parser, "missing command tree node", false);
+        return false;
+    }
+    if (depth > MISH_MAX_DEPTH) {
+        parser_error(parser, "command tree nesting limit exceeded", false);
+        return false;
+    }
+    size_t minimum = 0;
+    size_t maximum = SIZE_MAX;
+    bool needs_name = false;
+    switch (node->type) {
+    case NODE_SIMPLE:
+        maximum = 0;
+        if (node->words.len == 0 && node->redirs == NULL) {
+            parser_error(parser, "empty simple command", false);
+            return false;
+        }
+        break;
+    case NODE_LIST:
+        break;
+    case NODE_AND:
+    case NODE_OR:
+    case NODE_WHILE:
+    case NODE_UNTIL:
+        minimum = 2;
+        maximum = 2;
+        break;
+    case NODE_PIPE:
+        minimum = 2;
+        break;
+    case NODE_IF:
+        minimum = 2;
+        maximum = 3;
+        break;
+    case NODE_BACKGROUND:
+    case NODE_SUBSHELL:
+    case NODE_GROUP:
+    case NODE_NOT:
+        minimum = 1;
+        maximum = 1;
+        break;
+    case NODE_FUNCTION:
+    case NODE_FOR:
+        minimum = 1;
+        maximum = 1;
+        needs_name = true;
+        break;
+    case NODE_ARITH_FOR:
+        minimum = 1;
+        maximum = 1;
+        if (node->words.len != 3) {
+            parser_error(parser, "arithmetic loop requires three expressions", false);
+            return false;
+        }
+        break;
+    case NODE_CASE:
+        maximum = 0;
+        needs_name = true;
+        break;
+    }
+    if (node->count < minimum || node->count > maximum) {
+        parser_error(parser, "invalid compound command shape", false);
+        return false;
+    }
+    if (needs_name && node->name == NULL) {
+        parser_error(parser, "missing compound command name", false);
+        return false;
+    }
+    for (const Redir *redirection = node->redirs; redirection != NULL; redirection = redirection->next) {
+        if (redirection->fd < 0 || redirection->word == NULL) {
+            parser_error(parser, "invalid redirection metadata", false);
+            return false;
+        }
+        if (redirection->type == REDIR_HEREDOC && redirection->heredoc == NULL) {
+            parser_error(parser, "missing here document body", false);
+            return false;
+        }
+    }
+    for (size_t index = 0; index < node->count; ++index) {
+        if (!validate_tree(parser, node->children[index], depth + 1)) {
+            return false;
+        }
+    }
+    for (const CaseArm *arm = node->cases; arm != NULL; arm = arm->next) {
+        if (arm->patterns.len == 0 || !validate_tree(parser, arm->body, depth + 1)) {
+            if (!parser->failed) {
+                parser_error(parser, "empty case pattern list", false);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+Node *parse_source(const char *source, ParseError *error)
+{
+    Parser parser;
+    memset(&parser, 0, sizeof(parser));
+    parser.error = error;
+    if (lex_source(source, &parser.tokens, error) != 0) {
+        return NULL;
+    }
+    Stop stop;
+    memset(&stop, 0, sizeof(stop));
+    Node *node = parse_list(&parser, stop);
+    if (node != NULL && peek(&parser)->type != TOK_EOF) {
+        unexpected(&parser, "end of input");
+    }
+    if (node != NULL && !parser.failed) {
+        validate_tree(&parser, node, 0);
+    }
+    if (parser.failed) {
+        node_free(node);
+        node = NULL;
+    }
+    tokens_free(&parser.tokens);
+    return node;
 }
